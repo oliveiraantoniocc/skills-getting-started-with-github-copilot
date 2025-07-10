@@ -8,6 +8,8 @@ for extracurricular activities at Mergington High School.
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
+from motor.motor_asyncio import AsyncIOMotorClient
+from contextlib import asynccontextmanager
 import os
 from pathlib import Path
 
@@ -19,8 +21,13 @@ current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
 
-# In-memory activity database
-activities = {
+# MongoDB connection
+client = AsyncIOMotorClient("mongodb://localhost:27017")
+db = client.mergington_school
+activities_collection = db.activities
+
+# Initial activity data to populate the database
+initial_activities = {
     "Chess Club": {
         "description": "Learn strategies and compete in chess tournaments",
         "schedule": "Fridays, 3:30 PM - 5:00 PM",
@@ -81,49 +88,83 @@ activities = {
 }
 
 
+async def populate_database():
+    """Pre-populate the database with initial activities if it's empty"""
+    count = await activities_collection.count_documents({})
+    if count == 0:
+        # Convert activities to documents with activity name as _id
+        documents = []
+        for activity_name, activity_data in initial_activities.items():
+            document = {"_id": activity_name, **activity_data}
+            documents.append(document)
+        
+        await activities_collection.insert_many(documents)
+        print(f"Database populated with {len(documents)} activities")
+
+
+@app.on_event("startup")
+async def startup_event():
+    await populate_database()
+
+
 @app.get("/")
 def root():
     return RedirectResponse(url="/static/index.html")
 
 
 @app.get("/activities")
-def get_activities():
+async def get_activities():
+    """Get all activities from MongoDB"""
+    activities = {}
+    async for activity in activities_collection.find():
+        activity_name = activity.pop("_id")  # Remove _id and use it as key
+        activities[activity_name] = activity
     return activities
 
 
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+async def signup_for_activity(activity_name: str, email: str):
     """Sign up a student for an activity"""
     # Validate activity exists
-    if activity_name not in activities:
+    activity = await activities_collection.find_one({"_id": activity_name})
+    if not activity:
         raise HTTPException(status_code=404, detail="Activity not found")
-
-    # Get the specific activity
-    activity = activities[activity_name]
 
     # Validate student is not already signed up
     if email in activity["participants"]:
         raise HTTPException(status_code=400, detail="Already signed up for this activity")
 
-    # Add student
-    activity["participants"].append(email)
+    # Add student to the activity
+    result = await activities_collection.update_one(
+        {"_id": activity_name},
+        {"$push": {"participants": email}}
+    )
+    
+    if result.modified_count == 0:
+        raise HTTPException(status_code=500, detail="Failed to sign up for activity")
+    
     return {"message": f"Signed up {email} for {activity_name}"}
 
 
 @app.delete("/activities/{activity_name}/remove")
-def remove_participant_from_activity(activity_name: str, email: str):
+async def remove_participant_from_activity(activity_name: str, email: str):
     """Remove a participant from an activity"""
     # Validate activity exists
-    if activity_name not in activities:
+    activity = await activities_collection.find_one({"_id": activity_name})
+    if not activity:
         raise HTTPException(status_code=404, detail="Activity not found")
-
-    # Get the specific activity
-    activity = activities[activity_name]
 
     # Validate student is signed up
     if email not in activity["participants"]:
         raise HTTPException(status_code=400, detail="Student not signed up for this activity")
 
-    # Remove student
-    activity["participants"].remove(email)
+    # Remove student from the activity
+    result = await activities_collection.update_one(
+        {"_id": activity_name},
+        {"$pull": {"participants": email}}
+    )
+    
+    if result.modified_count == 0:
+        raise HTTPException(status_code=500, detail="Failed to remove participant")
+    
     return {"message": f"Removed {email} from {activity_name}"}
